@@ -77,11 +77,16 @@
 use {
     acme_client::{error::Error, Directory},
     actix::prelude::*,
+    actix_files::NamedFile,
+    actix_http::{
+        Response, Request,
+    },
+    actix_service::{
+        ServiceFactory, IntoServiceFactory,
+    },
     actix_web::{
         self,
-        fs::NamedFile,
-        http::Method,
-        server::{HttpServer, IntoHttpHandler},
+        HttpServer,
         App, HttpRequest,
     },
     chrono::{offset::TimeZone, Utc},
@@ -97,7 +102,6 @@ use {
         io::Read,
         net::{SocketAddr, ToSocketAddrs},
         path::{Path, PathBuf},
-        str::FromStr,
         time::Duration,
     },
 };
@@ -215,10 +219,10 @@ impl CertBuilder {
         ssl_directory: &PathBuf,
         domains: &[String],
     ) {
-        let mut file;
+        let file;
 
         match pathp {
-            None => file = Self::default_file(stem, domains),
+            None => file = PathBuf::from(format!("{}_{}.pem", &domains[0], stem)),
             Some(path) => {
                 if path.is_absolute() {
                     *pathp = Some(path.to_path_buf());
@@ -229,10 +233,6 @@ impl CertBuilder {
             }
         }
         *pathp = Some(ssl_directory.join(file));
-    }
-
-    fn default_file(stem: &str, domains: &[String]) -> PathBuf {
-        PathBuf::from_str(&format!("{}_{}.pem", &domains[0], stem)).unwrap()
     }
 
     fn needs_building(&self) -> bool {
@@ -255,6 +255,8 @@ impl CertBuilder {
 }
 
 use serde::Deserialize;
+use actix_web::dev::{MessageBody, ServiceRequest, ServiceResponse, AppConfig};
+use std::fmt;
 
 #[derive(Clone, Deserialize)]
 pub struct LetsEncrypt {
@@ -335,46 +337,52 @@ impl LetsEncrypt {
 
     pub fn ssl_directory<P>(mut self, path: P) -> Self
     where
-        P: AsRef<Path>,
+        P: Into<PathBuf>,
     {
-        self.ssl_directory = PathBuf::from(path.as_ref());
+        self.ssl_directory = path.into();
         self
     }
 
-    pub fn register(&self, app: App) -> App {
-        let nonce = self.nonce();
+    pub fn register<    B: MessageBody,
+        T: ServiceFactory<
+            Config = (),
+            Request = ServiceRequest,
+            Response = ServiceResponse<B>,
+            Error = actix_http::Error,
+            InitError = (),
+        >,>(&self, app: App<T, B>) -> App<T, B> {
+        struct NonceDir(PathBuf);
+        async fn handle(req: HttpRequest, nonce_dir: actix_web::web::Data<NonceDir>) -> NamedFile {
+            // TODO error on empty token
+            let token = req.match_info().query("token");
+            let mut path = nonce_dir.get_ref().0.clone();
+            path.push(".well-known");
+            path.push("acme-challenge");
+            path.push(token);
+            NamedFile::open(path.as_path()).unwrap()
+        }
 
-        app.resource("/.well-known/acme-challenge/{token}", |r| {
-            r.method(Method::GET).f(nonce)
-        })
+        app.data(NonceDir(self.nonce_directory.clone())).route("/.well-known/acme-challenge/{token}", actix_web::web::get().to(handle))
     }
 
-    pub fn attach_certificates_to<H, F>(&self, mut server: HttpServer<H, F>) -> HttpServer<H, F>
+    pub fn attach_certificates_to<F, I, S, B>(&self, mut server: HttpServer<F, I, S, B>) -> HttpServer<F, I, S, B>
     where
-        H: IntoHttpHandler + 'static,
-        F: Fn() -> H + Send + Clone + 'static,
+        F: Fn() -> I + Send + Clone + 'static,
+        I: IntoServiceFactory<S>,
+        S: ServiceFactory<Config = AppConfig, Request = Request> + 'static,
+        S::Error: Into<actix_http::Error>,
+        S::InitError: fmt::Debug,
+        S::Response: Into<Response<B>>,
+        B: MessageBody + 'static,
     {
         for cert_builder in &self.cert_builders {
             if cert_builder.key_and_cert_present() {
                 server = server
-                    .bind_ssl(&cert_builder.addrs[..], cert_builder.ssl_builder())
+                    .bind_openssl(cert_builder.addrs[0], cert_builder.ssl_builder())
                     .unwrap();
             }
         }
         server
-    }
-
-    fn nonce(&self) -> impl Fn(&HttpRequest) -> actix_web::Result<NamedFile> {
-        let path = PathBuf::from(&self.nonce_directory);
-
-        move |req: &HttpRequest| {
-            let token: PathBuf = req.match_info().query("token")?;
-            let path = PathBuf::from(&path)
-                .join(".well-known")
-                .join("acme-challenge")
-                .join(token);
-            Ok(NamedFile::open(path)?)
-        }
     }
 
     fn build_cert(&self, cert_builder: &CertBuilder) -> Result<(), Error> {
