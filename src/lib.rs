@@ -99,7 +99,7 @@ use {
         ffi::OsStr,
         fmt::Display,
         fs::{self, File},
-        io::Read,
+        io::{self, Read},
         net::{SocketAddr, ToSocketAddrs},
         path::{Path, PathBuf},
         time::Duration,
@@ -365,7 +365,7 @@ impl LetsEncrypt {
         app.data(NonceDir(self.nonce_directory.clone())).route("/.well-known/acme-challenge/{token}", actix_web::web::get().to(handle))
     }
 
-    pub fn attach_certificates_to<F, I, S, B>(&self, mut server: HttpServer<F, I, S, B>) -> HttpServer<F, I, S, B>
+    pub fn attach_certificates_to<F, I, S, B>(&self, mut server: HttpServer<F, I, S, B>) -> io::Result<HttpServer<F, I, S, B>>
     where
         F: Fn() -> I + Send + Clone + 'static,
         I: IntoServiceFactory<S>,
@@ -378,11 +378,10 @@ impl LetsEncrypt {
         for cert_builder in &self.cert_builders {
             if cert_builder.key_and_cert_present() {
                 server = server
-                    .bind_openssl(cert_builder.addrs[0], cert_builder.ssl_builder())
-                    .unwrap();
+                    .bind_openssl(cert_builder.addrs[0], cert_builder.ssl_builder())?;
             }
         }
-        server
+        Ok(server)
     }
 
     fn build_cert(&self, cert_builder: &CertBuilder) -> Result<(), Error> {
